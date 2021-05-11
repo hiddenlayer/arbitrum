@@ -19,6 +19,8 @@ package broadcastclient
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"io/ioutil"
 	"math/big"
 	"net"
 	"sync"
@@ -41,6 +43,7 @@ type BroadcastClient struct {
 	retrying                     bool
 	shuttingDown                 bool
 	ConfirmedAccumulatorListener chan common.Hash
+	lastHeard                    time.Time
 }
 
 var logger = log.With().Caller().Str("component", "broadcaster").Logger()
@@ -57,15 +60,16 @@ func NewBroadcastClient(websocketUrl string, lastInboxSeqNum *big.Int) *Broadcas
 		startingBroadcastClientMutex: &sync.Mutex{},
 		websocketUrl:                 websocketUrl,
 		lastInboxSeqNum:              seqNum,
+		lastHeard:                    time.Now(),
 	}
 }
 
-func (bc *BroadcastClient) Connect() (chan broadcaster.BroadcastFeedMessage, error) {
+func (bc *BroadcastClient) Connect(ctx context.Context) (chan broadcaster.BroadcastFeedMessage, error) {
 	messageReceiver := make(chan broadcaster.BroadcastFeedMessage)
-	return bc.connect(messageReceiver)
+	return bc.connect(ctx, messageReceiver)
 }
 
-func (bc *BroadcastClient) connect(messageReceiver chan broadcaster.BroadcastFeedMessage) (chan broadcaster.BroadcastFeedMessage, error) {
+func (bc *BroadcastClient) connect(ctx context.Context, messageReceiver chan broadcaster.BroadcastFeedMessage) (chan broadcaster.BroadcastFeedMessage, error) {
 	if len(bc.websocketUrl) == 0 {
 		// Nothing to do
 		return nil, nil
@@ -82,14 +86,14 @@ func (bc *BroadcastClient) connect(messageReceiver chan broadcaster.BroadcastFee
 
 	bc.conn = conn
 
-	go bc.backgroundReader(messageReceiver)
+	go bc.backgroundReader(ctx, messageReceiver)
 
 	return messageReceiver, err
 }
 
-func (bc *BroadcastClient) backgroundReader(messageReceiver chan broadcaster.BroadcastFeedMessage) {
+func (bc *BroadcastClient) backgroundReader(ctx context.Context, messageReceiver chan broadcaster.BroadcastFeedMessage) {
 	for {
-		msg, op, err := wsutil.ReadServerData(bc.conn)
+		msg, op, err := bc.readData(ctx, bc.conn, ws.StateClientSide, ws.OpText|ws.OpBinary)
 		if err != nil {
 			if bc.shuttingDown {
 				return
@@ -97,7 +101,7 @@ func (bc *BroadcastClient) backgroundReader(messageReceiver chan broadcaster.Bro
 			logger.Error().Err(err).Int("opcode", int(op)).Msgf("error calling ReadServerData")
 			_ = bc.conn.Close()
 			// Starts up a new backgroundReader
-			bc.RetryConnect(messageReceiver)
+			bc.RetryConnect(ctx, messageReceiver)
 			return
 		}
 
@@ -116,6 +120,7 @@ func (bc *BroadcastClient) backgroundReader(messageReceiver chan broadcaster.Bro
 
 		if res.Version == 1 {
 			for _, message := range res.Messages {
+				logger.Debug().Msg("Received message from feed")
 				messageReceiver <- *message
 			}
 
@@ -126,7 +131,62 @@ func (bc *BroadcastClient) backgroundReader(messageReceiver chan broadcaster.Bro
 	}
 }
 
-func (bc *BroadcastClient) RetryConnect(messageReceiver chan broadcaster.BroadcastFeedMessage) {
+func (bc *BroadcastClient) readData(ctx context.Context, conn io.ReadWriter, state ws.State, want ws.OpCode) ([]byte, ws.OpCode, error) {
+	controlHandler := wsutil.ControlFrameHandler(conn, state)
+	reader := wsutil.Reader{
+		Source:          conn,
+		State:           state,
+		CheckUTF8:       true,
+		SkipHeaderCheck: false,
+		OnIntermediate:  controlHandler,
+	}
+
+	// Remove timeout when leaving this function
+	defer func(conn net.Conn) {
+		err := conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			logger.Error().Err(err).Msg("error removing read deadline")
+		}
+	}(bc.conn)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, 0, nil
+		default:
+		}
+
+		err := bc.conn.SetReadDeadline(time.Now().Add(time.Second * 15))
+		if err != nil {
+			return nil, 0, err
+		}
+
+		header, err := reader.NextFrame()
+		if err != nil {
+			return nil, 0, err
+		}
+
+		bc.lastHeard = time.Now()
+		if header.OpCode.IsControl() {
+			if err := controlHandler(header, &reader); err != nil {
+				return nil, 0, err
+			}
+			continue
+		}
+		if header.OpCode&want == 0 {
+			if err := reader.Discard(); err != nil {
+				return nil, 0, err
+			}
+			continue
+		}
+
+		data, err := ioutil.ReadAll(&reader)
+
+		return data, header.OpCode, err
+	}
+}
+
+func (bc *BroadcastClient) RetryConnect(ctx context.Context, messageReceiver chan broadcaster.BroadcastFeedMessage) {
 	MaxWaitMs := 15000
 	waitMs := 500
 	bc.retrying = true
@@ -134,7 +194,7 @@ func (bc *BroadcastClient) RetryConnect(messageReceiver chan broadcaster.Broadca
 		time.Sleep(time.Duration(waitMs) * time.Millisecond)
 
 		bc.RetryCount++
-		_, err := bc.connect(messageReceiver)
+		_, err := bc.connect(ctx, messageReceiver)
 		if err == nil {
 			bc.retrying = false
 			return
