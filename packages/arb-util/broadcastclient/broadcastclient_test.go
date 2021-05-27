@@ -119,15 +119,7 @@ func TestServerDisconnectsAClientIfItDoesNotRespondToPings(t *testing.T) {
 
 }
 
-// with the current functionality,
-// there is no way for the client to know that
-// it's connection has been closed by the server
-// something needs to be built in the client
-// where by if it doesn't hear from the server
-// in 10 seconds, it should re-initiate the connection
-
 func TestBroadcastClientReconnectsOnServerDisconnect(t *testing.T) {
-	t.Skip("currently broken")
 	ctx := context.Background()
 
 	broadcasterSettings := broadcaster.Settings{
@@ -135,8 +127,8 @@ func TestBroadcastClientReconnectsOnServerDisconnect(t *testing.T) {
 		Workers:                 128,
 		Queue:                   1,
 		IoReadWriteTimeout:      2 * time.Second,
-		ClientPingInterval:      5 * time.Second,
-		ClientNoResponseTimeout: 15 * time.Second,
+		ClientPingInterval:      50 * time.Second,
+		ClientNoResponseTimeout: 150 * time.Second,
 	}
 
 	b1 := broadcaster.NewBroadcaster(broadcasterSettings)
@@ -145,8 +137,10 @@ func TestBroadcastClientReconnectsOnServerDisconnect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer b1.Stop()
 
 	broadcastClient := NewBroadcastClient("ws://127.0.0.1:9743/", nil)
+	broadcastClient.idleTimeout = 2 * time.Second
 
 	// connect returns
 	_, err = broadcastClient.Connect(ctx)
@@ -154,21 +148,9 @@ func TestBroadcastClientReconnectsOnServerDisconnect(t *testing.T) {
 		t.Errorf("Can not connect: %v\n", err)
 	}
 
-	b1.Stop()
+	time.Sleep(4000 * time.Millisecond)
 
-	time.Sleep(1000 * time.Millisecond)
-
-	b2 := broadcaster.NewBroadcaster(broadcasterSettings)
-	err = b2.Start(ctx)
-	if err != nil {
-		t.Fatal("error restarting broadcaster")
-	}
-
-	for broadcastClient.retrying == true {
-		time.Sleep(1000 * time.Millisecond)
-	}
-
-	if broadcastClient.RetryCount <= 0 {
+	if broadcastClient.GetRetryCount() <= 0 {
 		t.Error("Should have had some retry counts")
 	}
 }
